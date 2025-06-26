@@ -1,0 +1,259 @@
+import shutil
+import subprocess
+import yaml
+import numpy as np
+import pandas as pd
+import os
+import re
+from snakemake.utils import validate
+
+include: "rules/samtools.smk"
+
+# Define constants and variables
+RES = config["qutrna"]["output_dir"]
+
+REF_FASTA = config["qutrna"]["ref_fasta"]
+REF_NO_LINKER_FASTA = RES+"/data/no_linker.fasta"
+REF_FILTERED_TRNAS_FASTA = RES+"/data/filtered_trnas.fasta"
+
+# FASTQ or BAM - simplified for single FASTQ files
+READS = "fastq"
+
+# Load sample table from config
+sample_table = pd.read_csv(config["sample_table"], sep="\t")
+
+# Simplified sample table processing - no conditions or subsamples
+TBL = sample_table
+SAMPLES = TBL["sample_name"].unique().tolist()
+
+# Define FILTERS_APPLIED as empty list for minimal workflow
+FILTERS_APPLIED = []
+
+wildcard_constraints:
+    SAMPLE="|".join(SAMPLES),
+    ORIENT="|".join(["fwd", "rev"]),
+
+# Helper functions
+def fname2sample(fname):
+    r = re.search("/sample~([^~/]+)", fname)
+    if r:
+        return r.group(1)
+
+def _collect_input(suffix):
+    def helper(wildcards):
+        t2fnames = {}
+        for sample in SAMPLES:
+            df = TBL.loc[[sample]]
+            # collect samples
+            for row in df.itertuples(index=False):
+                t2fnames.setdefault("raw", []).append(f"data/bams/sample~{sample}/sample~{sample}.{suffix}")
+                # For minimal workflow, we don't use filters, so just return raw
+        return t2fnames
+    return helper
+
+# Define targets for the minimal workflow
+def target_alignment():
+    targets = []
+    for sample in SAMPLES:
+        targets.extend(
+            expand(RES+"/results/plots/alignment/sample~{sample}/sample~{sample}_score.pdf",
+                   sample=sample))
+    return targets
+
+# Main rule that chains all the specified rules
+rule all:
+    input: 
+        target_alignment() + 
+        [RES+"/results/read_counts.tsv", RES+"/results/alignment_scores.tsv"]
+
+# Rule to remove linkers from reference
+rule remove_linker:
+    input: REF_FASTA
+    output: REF_NO_LINKER_FASTA
+    conda: "qutrna"
+    resources:
+        mem_mb=2000
+    log: RES+"/logs/remove_linker.log"
+    params: 
+        linker5=config["qutrna"]["linker5"],
+        linker3=config["qutrna"]["linker3"]
+    shell: """
+        python ../workflow/scripts/remove_linker.py \
+            --linker5 {params.linker5} \
+            --linker3 {params.linker3} \
+            --output {output:q} \
+            {input:q} \
+            2> {log:q}
+    """
+
+# Rule to remove specific tRNAs if needed
+rule remove_trnas:
+    input: REF_NO_LINKER_FASTA
+    output: REF_FILTERED_TRNAS_FASTA
+    conda: "qutrna"
+    resources:
+        mem_mb=2000
+    log: RES+"/logs/remove_trnas.log"
+    params: 
+        opts=""  # No tRNA removal in minimal workflow
+    shell: """
+        cp {input:q} {output:q}
+    """
+
+# Rule to pre-process FASTQ files
+rule parasail_pre_process_fastq:
+    input: lambda wildcards: TBL.loc[TBL["sample_name"] == wildcards.SAMPLE, "fastq"].iloc[0]
+    output: temp(RES+"/results/fastq/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}.fastq.gz")
+    conda: "qutrna"
+    resources:
+        mem_mb=2000
+    log: RES+"/logs/parasail/pre_process_fastq/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}.log"
+    params:
+        opts=lambda wildcards: "-r" if wildcards.ORIENT == "rev" else ""
+    shell: """
+        python ../workflow/scripts/generate_fastq.py \
+            -t {params.opts} \
+            -o {output:q} \
+            {input:q} 2> {log:q}
+    """
+
+
+# Rule to map reads with parasail
+rule parasail_map:
+    input: 
+        fastq=RES+"/results/fastq/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}.fastq.gz",
+        ref_fasta=lambda wildcards: REF_NO_LINKER_FASTA if (config["qutrna"]["linker5"] > 0 or config["qutrna"]["linker3"] > 0) else REF_FASTA
+    output: temp(RES+"/results/bams/mapped/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}_raw.bam")
+    log: RES+"/logs/parasail/map/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}.log"
+    conda: "qutrna"
+    resources:
+        mem_mb=16000
+    threads: config["parasail"]["threads"]
+    params: 
+        parasail_opts=config["parasail"]["opts"],
+        batch_size=f"-b {config['parasail']['batch_size']}"
+    shell: """
+        echo "batch_size: {params.batch_size}"
+        echo "threads: {threads}"
+        echo "parasail_opts: {params.parasail_opts}"
+        
+        # Unzip fastq file to temporary file since parasail_aligner lacks zlib support
+        unzipped_fastq={input.fastq:q}
+        unzipped_fastq=${{unzipped_fastq%.fastq.gz}}.fastq.tmp
+        gunzip -c {input.fastq:q} > $unzipped_fastq
+        
+        # Run parasail alignment using unzipped temporary file
+        parasail_aligner {params.parasail_opts} {params.batch_size} \
+            -t {threads} \
+            -O SAMH \
+            -f {input.ref_fasta:q} \
+            -g {output:q}.tmp \
+            < $unzipped_fastq 2> {log:q}
+            
+        # Convert SAM to BAM and calculate MD tags
+        samtools view -bS {output}.tmp | \
+            samtools calmd --output-fmt BAM /dev/stdin {input.ref_fasta:q} > {output:q}
+            
+        # Clean up temporary files
+        if [ -f "{output}.tmp" ]; then
+            rm "{output}.tmp"
+        fi
+        if [ -f "$unzipped_fastq" ]; then
+            rm "$unzipped_fastq"
+        fi
+    """
+
+# Rule to retain highest scoring alignments
+rule parasail_retain_highest_scoring_alignment:
+    input: 
+        bam=RES+"/results/bams/mapped/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}_raw.bam",
+        ref_fasta=REF_FASTA
+    output: RES+"/results/bams/filtered/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}.sorted.bam"
+    log: RES+"/logs/parasail/retain_highest_scoring_alignment/sample~{SAMPLE}/orient~{ORIENT}/sample~{SAMPLE}.log"
+    conda: "qutrna"
+    resources:
+        mem_mb=6000
+    params: 
+        min_aln_score=config["params"]["min_aln_score"]
+    shell: """
+        (
+            samtools sort -n -m 4G {input.bam:q} | \
+            python ../workflow/scripts/fix_retain_highest_alignment.py --min-mapq {params.min_aln_score} | \
+            samtools sort -o {output:q} -m 4G /dev/stdin && samtools index {output:q}
+        ) 2> {log:q}
+    """
+
+# Rule to filter by random score distribution
+rule parasail_filter_by_random_score:
+    input: 
+        fwd=RES+"/results/bams/filtered/sample~{SAMPLE}/orient~fwd/sample~{SAMPLE}.sorted.bam",
+        rev=RES+"/results/bams/filtered/sample~{SAMPLE}/orient~rev/sample~{SAMPLE}.sorted.bam"
+    output: 
+        prc_plot=RES+"/results/plots/alignment/sample~{SAMPLE}/sample~{SAMPLE}_prc_reads.pdf",
+        score_plot=RES+"/results/plots/alignment/sample~{SAMPLE}/sample~{SAMPLE}_score.pdf",
+        cutoff=RES+"/results/bams/filtered/sample~{SAMPLE}/sample~{SAMPLE}_cutoff.txt",
+        fwd_scores=RES+"/results/bams/filtered/sample~{SAMPLE}/orient~fwd/sample~{SAMPLE}_scores.txt",
+        rev_scores=RES+"/results/bams/filtered/sample~{SAMPLE}/orient~rev/sample~{SAMPLE}_scores.txt"
+    params: 
+        precision=config["params"]["precision"],
+        title=lambda wildcards: f"tRNA Alignment Score {wildcards.SAMPLE} distributions"
+    log: RES+"/logs/parasail/filter_by_random_score/sample~{SAMPLE}/sample~{SAMPLE}.log"
+    conda: "qutrna"
+    resources:
+        mem_mb=2000
+    shell: """
+        mkdir -p {RES}/results/plots/alignment/sample~{wildcards.SAMPLE}/
+        mkdir -p {RES}/results/bams/filtered/sample~{wildcards.SAMPLE}/
+        
+        # Extract alignment scores from BAM files
+        samtools view {input.fwd:q} | cut -f 5 > {output.fwd_scores:q}
+        samtools view {input.rev:q} | cut -f 5 > {output.rev_scores:q}
+        
+        # Run R script with score files
+        Rscript --vanilla ../workflow/scripts/alignment_score_cutoff.R \
+            -f {output.fwd_scores:q} \
+            -r {output.rev_scores:q} \
+            -P {output.prc_plot:q} \
+            -S {output.score_plot:q} \
+            -C {output.cutoff:q} \
+            -p {params.precision} \
+            -t {params.title:q} 2> {log:q}
+    """
+
+
+# Rule to collect read counts
+rule collect_read_counts:
+    input: lambda wildcards: expand(RES+"/results/bams/filtered/sample~{sample}/orient~fwd/sample~{sample}.sorted_read_count.txt", sample=SAMPLES)
+    output: RES+"/results/read_counts.tsv"
+    run:
+        dfs = []
+        for fname in input:
+            df = pd.read_csv(fname, sep="\t", header=None, names=["read_count"])
+            df["read_type"] = "raw"
+            df[["sample", "subsample", "base_calling"]] = ""
+            sample = fname2sample(fname)
+            df["sample"] = sample
+            df["subsample"] = sample
+            df["base_calling"] = "unknown"
+            df["condition"] = "unknown"
+            df["fname"] = fname
+            dfs.append(df)
+        df = pd.concat(dfs, ignore_index=True)
+        df.to_csv(output[0], sep="\t", index=False)
+
+# Rule to collect alignment scores
+rule collect_as:
+    input: lambda wildcards: expand(RES+"/results/bams/filtered/sample~{sample}/orient~fwd/sample~{sample}_score.tsv", sample=SAMPLES)
+    output: RES+"/results/alignment_scores.tsv"
+    run:
+        dfs = []
+        for fname in input:
+            df = pd.read_csv(fname, sep="\t", header=None, names=["as", "count"])
+            df["read_type"] = "raw"
+            
+            sample = fname2sample(fname)
+            df["sample"] = sample
+            df["fname"] = fname
+            dfs.append(df)
+        df = pd.concat(dfs, ignore_index=True)
+        df.to_csv(output[0], sep="\t", index=False)

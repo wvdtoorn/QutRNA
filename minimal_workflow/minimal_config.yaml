@@ -1,0 +1,38 @@
+sample_table: sample_table.tsv
+
+qutrna:
+  output_dir: .
+  ref_fasta: reference.fasta
+  linker5: 24
+  linker3: 20
+  
+params:
+  precision: 0.999
+  min_aln_score: 10
+
+parasail:
+  opts: "-a sw_trace_striped_sse41_128_16 -M 2 -X 1 -c 10 -x -d"
+  batch_size: 1000
+  threads: 4
+  lines: 0
+
+# Optional preprocessing filters (set to false/empty to disable)
+preprocess:
+  samtools:
+    filter: "-F 3328"
+    calmd: true
+  read_length:
+    min: 0
+    max: 0
+  alignment_length:
+    min: 0
+    max: 0
+  trim_cigar: false
+  remove_multimappers: false
+  overlap: false
+
+# Data inclusion settings
+include:
+  ref_fasta: "link"
+  fastq: "link"
+  bam: "link" 
